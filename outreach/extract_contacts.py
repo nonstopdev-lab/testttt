@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Collect public Telegram links and contact emails from company websites.
 
-Usage: python3 extract_contacts.py domains.txt output.csv
+Usage: python3 extract_contacts.py domains.txt output.csv [--js]
 domains.txt: one domain or URL per line.
+
+--js  re-check sites that showed no Telegram link in their static HTML by
+      rendering them in headless Chromium (needs: pip install playwright).
 """
-import csv, re, ssl, sys
+import csv, os, re, ssl, sys
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 
@@ -24,18 +27,21 @@ def fetch(url):
         return ""
 
 
-def process(raw):
+def parse(html, tg, mails):
+    tg |= {m for m in TG_RE.findall(html) if m.lower() not in SKIP_TG}
+    mails |= {m for m in MAIL_RE.findall(html) if not m.lower().endswith(SKIP_MAIL_EXT)}
+
+
+def normalize(raw):
     base = raw.strip()
     if not base:
         return None
     if not base.startswith("http"):
         base = "https://" + base
-    base = base.rstrip("/")
-    tg, mails = set(), set()
-    for p in PATHS:
-        html = fetch(base + p)
-        tg |= {m for m in TG_RE.findall(html) if m.lower() not in SKIP_TG}
-        mails |= {m for m in MAIL_RE.findall(html) if not m.lower().endswith(SKIP_MAIL_EXT)}
+    return base.rstrip("/")
+
+
+def row(base, tg, mails):
     return {
         "website": base,
         "telegram": " | ".join(f"https://t.me/{t}" for t in sorted(tg)),
@@ -43,10 +49,56 @@ def process(raw):
     }
 
 
-def main(src, dst):
+def process(raw):
+    base = normalize(raw)
+    if not base:
+        return None
+    tg, mails = set(), set()
+    for p in PATHS:
+        parse(fetch(base + p), tg, mails)
+    return row(base, tg, mails)
+
+
+def render_pass(rows):
+    """Re-check rows with no Telegram link using a real browser."""
+    from playwright.sync_api import sync_playwright
+
+    todo = [r for r in rows if not r["telegram"]]
+    if not todo:
+        return
+    kwargs = {}
+    exe = os.environ.get("CHROMIUM_PATH")
+    if exe:
+        kwargs["executable_path"] = exe
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(**kwargs)
+        ctx = browser.new_context(user_agent=HEADERS["User-Agent"])
+        for r in todo:
+            tg, mails = set(), set()
+            for p in PATHS:
+                page = ctx.new_page()
+                try:
+                    page.goto(r["website"] + p, wait_until="networkidle", timeout=20000)
+                    page.wait_for_timeout(1500)
+                    hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+                    parse(page.content() + "\n" + "\n".join(hrefs), tg, mails)
+                except Exception:
+                    pass
+                finally:
+                    page.close()
+            if tg:
+                r["telegram"] = row(r["website"], tg, set())["telegram"]
+            if mails and not r["emails"]:
+                r["emails"] = row(r["website"], set(), mails)["emails"]
+        browser.close()
+
+
+def main(src, dst, use_js):
     domains = [l for l in open(src) if l.strip()]
     with ThreadPoolExecutor(max_workers=10) as ex:
         rows = [r for r in ex.map(process, domains) if r]
+    if use_js:
+        render_pass(rows)
     with open(dst, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["website", "telegram", "emails"])
         w.writeheader()
@@ -55,4 +107,5 @@ def main(src, dst):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    args = [a for a in sys.argv[1:] if a != "--js"]
+    main(args[0], args[1], "--js" in sys.argv)
